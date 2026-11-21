@@ -1,0 +1,556 @@
+---
+title: "Predictive Analysis of US Flight Delays to JFK"
+author: "Arianna Morandi, Beatrice Spagnolo, Tomas Guarini"
+output: html_document
+---
+
+```{r initial_setup, include=FALSE}
+library("corrplot")
+library(leaps)
+library(car)
+library(MLmetrics)
+library(pROC)
+library(MASS)
+library(e1071)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# RESEARCH QUESTION
+
+Our analysis aim is to study the impact of multiple regressors, as flights departure delays, on flights arrival delays and how the same regressors can help in classifying either a flight will be delayed or not.
+
+# OBTAINING DATA
+
+We firstly imported the "aircrafts" dataset from Kaggle. It contains all the civil flights of 2023 in the USA, from all the airports to all the airports. It is made of 6,743,404 rows and 24 columns.
+
+```{r}
+flights <- read.csv("data/US_flights_2023.csv")
+```
+
+# CLEAN AND FILTER DATA
+
+We first selected only the flights that, leaving from all the airports, arrived in the JFK airport of NY, because what we want to study is the delay in arrival, given the conditions in the departure.
+
+```{r}
+flights_JFK <- flights[flights$Arr_Airport =="JFK", ]
+```
+
+## Merge of flights and weather
+
+Here we added the weather data to our dataset, merging "flights" and "weather" through "FlightDate" and "Dep_Airport" variables, to also have information about the weather conditions at the departure airport the day of the flight.
+
+```{r}
+weather <- read.csv("data/weather_meteo_by_airport.csv")
+dataset <- merge(flights_JFK, weather, by.x = c("FlightDate", "Dep_Airport"), by.y = c("time", "airport_id"), all = TRUE)
+cat(paste(colnames(dataset), collapse = ", "), "\n")
+```
+
+## Omit na values
+
+The reason why we have some rows with NA values is that the merge operation keep all rows from both datasets, even if there are no matching records in the other dataset, and since some departure airports don't have flights to the JFK this rows will have NA values from the first dataset.
+
+```{r}
+dataset <- na.omit(dataset)
+```
+
+## Delete variables
+
+We decided to delete some variables that are totally not useful for our analysis.
+
+```{r}
+useless_variables <- c("Tail_Number", "Dep_Delay_Type", "Arr_Delay_Type", "Distance_type", "Delay_Carrier", "Delay_Weather", "Delay_NAS", "Delay_Security", "Delay_LastAircraft", "Manufacturer", "Arr_CityName", "Dep_Delay_Tag", "Day_Of_Week")
+dataset_total <- dataset[, -which(names(dataset) %in% useless_variables)]
+```
+
+## Select flights
+
+In this part we took only the flights that are delayed
+
+```{r}
+dataset <- dataset_total[dataset_total$Arr_Delay > 0, ]
+```
+
+## Factor variable
+
+Here we created a factor variable, to be able to include it in our analysis, from the categorical variable "DepTime_label". This new variable takes values from 1 to 4, that respectively represents the different departure moments of the day: Morning, Afternoon, Evening and Night.
+
+```{r}
+dataset$DepTime_categoric <- factor(dataset$DepTime_label, levels = c("Morning", "Afternoon", "Evening", "Night"),labels = c(1, 2, 3, 4))
+head(dataset$DepTime_categoric)
+```
+
+This is our final dataset shape (49597, 20)
+
+```{r}
+cat(nrow(dataset), "rows and", ncol(dataset), "columns")
+```
+
+## Variables
+
+We then created a list containing all the numeric variables of interest to make it easier for further analysis.
+
+```{r}
+variables_of_interest <- c ("Arr_Delay", "Dep_Delay",  "Flight_Duration", "Aicraft_age", "tavg", "tmin", "tmax", "prcp", "snow", "wdir", "wspd", "pres")
+```
+
+Our variables are: "Arr_Delay" that represents the delay in arrival and is our dependent variable; "Dep_Delay" that represents the delay in departure; "Flight_Duration" that represents how long is the flight; "Aicraft_age" that represents how old is the plane; "tavg" that represents the average temperature in the departure airport; "tmin" that represents the minimum temperature in the departure airport; "tmax" that represents the maximum temperature in the departure airport; "prcp" that represents the mm of rain; "snow" that represents the mm of snow; "wdir" that represents the direction of the wind; "wspd" that is the speed of the wind and "pres" that is the air pressure.
+
+```{r}
+head(dataset[variables_of_interest])
+```
+
+# EXPLORE DATA
+
+## Boxplot
+
+We draw 4 boxplots of all the numerical variables strictly regarding the flight and then 8 boxplots of all the numerical variables regarding the weather conditions.
+
+```{r}
+par(mfrow = c(1, 4))
+par(pin = c(1, 2))
+boxplot(dataset$Dep_Delay, main = "Departure Delay", ylab = "Minutes")
+boxplot(dataset$Arr_Delay, main = "Arrival Delay", ylab = "Minutes")
+boxplot(dataset$Flight_Duration, main = "Flight Duration", ylab = "Minutes")
+boxplot(dataset$Aicraft_age, main = "Aicraft Age", ylab = "Years")
+par(mfrow = c(1, 1))
+```
+
+Starting from the first two boxplots, and given that the line inside the box indicates the median of the data and the box contains all the values in between the first and the third quartile, we can observe that:
+
+-   the median is close to zero that indicates that the majority of our flights are on time or have a slight delay,
+
+-   we have a long tail of outliers that are the delays that we are studying and represent the natural distribution of our data,
+
+-   and there is a point that is extremely far from the others that we can consider as an outlier to subsequently delete.
+
+For the other two boxplots we can notice that they have a more uniform distribution, but still with some outliers.
+
+```{r}
+par(mfrow = c(2, 4))
+boxplot(dataset$tavg, main = "Average temperature")
+boxplot(dataset$tmin, main = "Minimum temperature")
+boxplot(dataset$tmax, main = "Maximum temperature")
+boxplot(dataset$prcp, main = "Precipitation")
+boxplot(dataset$snow, main = "Snow")
+boxplot(dataset$wdir, main = "Wind direction")
+boxplot(dataset$wspd, main = "Wind speed")
+boxplot(dataset$pres, main = "Air pressure")
+par(mfrow = c(1, 1))
+```
+
+Starting from the boxplots of "Precipitation" and "Snow" we can notice that they have a median approximately equal to zero, that represents the fact that during the majority of the flights this two conditions didn't verify.
+
+For the rest of the boxplots instead we notice a uniform distribution, where the median value is close to the middle. "Average temperature", "Minimum temperature" and "Maximum temperature" present outliers only before the first quartile, while "Wind speed" only after the third quartile. "Air Pressure" have outliers on both sided of the box and "Wind direction" doesn't have any since it has higher variability and all the possible directions verify often.
+
+## Outliers
+
+We eliminate outliers related to variable "Dep_Delay", "Arr_Delay" and "prcp".
+
+```{r}
+outlier_Dep <- which.max(dataset$Dep_Delay)
+outlier_Arr <- which.max(dataset$Arr_Delay)
+dataset = dataset[-c(outlier_Dep, outlier_Arr), ]
+```
+
+```{r, echo=FALSE}
+par(mfrow = c(1, 4))
+par(pin = c(1, 2))
+boxplot(dataset$Dep_Delay, main = "Departure Delay", ylab = "Minutes")
+boxplot(dataset$Arr_Delay, main = "Arrival Delay", ylab = "Minutes")
+boxplot(dataset$Flight_Duration, main = "Flight Duration", ylab = "Minutes")
+boxplot(dataset$Aicraft_age, main = "Aicraft Age", ylab = "Years")
+par(mfrow = c(1, 1))
+```
+
+```{r}
+outlier_prcp <- which.max(dataset$prcp)
+dataset = dataset[-c(outlier_prcp), ]
+```
+
+```{r echo=FALSE}
+outlier_prcp <- which.max(dataset$prcp)
+dataset = dataset[-c(outlier_prcp), ]
+outlier_prcp <- which.max(dataset$prcp)
+dataset = dataset[-c(outlier_prcp), ]
+```
+
+```{r, echo=FALSE}
+par(mfrow = c(2, 4))
+boxplot(dataset$tavg, main = "Average temperature")
+boxplot(dataset$tmin, main = "Minimum temperature")
+boxplot(dataset$tmax, main = "Maximum temperature")
+boxplot(dataset$prcp, main = "Precipitation")
+boxplot(dataset$snow, main = "Snow")
+boxplot(dataset$wdir, main = "Wind direction")
+boxplot(dataset$wspd, main = "Wind speed")
+boxplot(dataset$pres, main = "Air pressure")
+par(mfrow = c(1, 1))
+```
+
+## Covariance
+
+```{r}
+cov_matrix <- cov(dataset[variables_of_interest])
+print(cov_matrix[ ,1])
+```
+
+Since the covariance describes how the variations in one variable are associated with the variations in the other variable, we can notice that we have 3 inverse relationship. For the variables "snow" and "wspd" the value is close to zero that means there is almost no covariance, while for the variable "pres" the value is low that means there is a stronger inverse relationship that is explained by the fact that when the air pressure decreases there is bad weather and so the flights delay could increase. In addition it is clear that the variable "Dep_Delay" is the one with the strongest covariance.
+
+## Correlation
+
+```{r}
+cor_matrix <- cor(dataset[variables_of_interest])
+corrplot(cor_matrix, method = "number", tl.col = "black", addCoef.col = "black", tl.srt = 45)
+```
+
+Since correlation measures the strength and direction of their linear relationship on a scale from -1 to 1, we can notice how "Dep_Delay" is the most correlated variable, while all the others are closer to zero so they have a weak correlation with our dependent variable.
+
+# MODEL DATA: REGRESSION
+
+## Train and test split
+
+We initially split the data, using the flight date and we decided that all the flights from January to September were becoming the train set while the ones from October to December the test set.
+
+```{r}
+train <- (dataset$FlightDate < "2023-09-30")
+data_train <- dataset[train,]
+data_test <- dataset[!train,]
+arr_delay_test <- dataset$Arr_Delay[!train]
+```
+
+## Simple linear regression
+
+We decided to use as a regressor "Dep_Delay" for our simple linear regression model because of it's strong correlation with our dependent variable.
+
+```{r}
+linearmodel = lm(Arr_Delay ~ Dep_Delay, data = data_train)
+plot(data_train$Arr_Delay, data_train$Dep_Delay, pch=20, xlab = "Arrival Delay", ylab = "Departure Delay")
+abline(linearmodel, lwd=2, col="red")
+```
+
+
+```{r}
+summary(linearmodel)
+```
+
+Our linear regression model, which examines the relationship between departure delay and arrival delay, has an R-squared value of 96.77%, that means we can explain nearly all the variance in arrival delay using departure delay. The coefficient for departure delay is 0.96, indicating that each minute of departure delay results in almost a minute of arrival delay. Both the intercept and the slope are statistically significant with p-values well below 0.001, confirming the robustness of our model. In addition a residual standard error indicates that, on average, the actual arrival delay differs from the predicted arrival delay by approximately 19.37 minutes.
+
+
+### Plots
+```{r}
+par(mfrow = c(2, 2))
+plot(linearmodel)
+par(mfrow = c(1, 1))
+```
+These diagnostic graphs are essential tools to validate the assumptions of our regression model. The Residuals vs Fitted chart verifies homogeneity and linearity, ensuring that residues are evenly distributed across the entire mounted value range. The Q-Q chart evaluates the normality of residues, a critical assumption for the validity of many statistical tests. The 'Scale-Location' chart further examines homoscedasticity, while the 'Residuals vs Leverage' chart identifies influential data points that could disproportionately affect our model’s predictions.
+In this case the Residuals vs Fitted and the Scale-Location plots show a tendency of the linear model to overestimate the biggest arriving delays, it could suggest that the residuals have a non-normal behaviour. This is confirmed by the Q-Q plot: the distribution of the residuals have a bigger right tail than the normal distribution. We may suppose that the relation between our variables is more complex than linearity.
+The graph 'Residuals vs Leverage' highlights the presence of an outlier: the point of observation 1526 has an high leverage and also an high residual, we therefore decided to eliminate this point from the graph. Together, these charts provide a complete check-up of our linear model.
+
+```{r}
+outlier <- which.max(linearmodel$residuals)
+data_train <- data_train[-outlier, ]
+linearmodel = lm(Arr_Delay ~ Dep_Delay, data = data_train)
+summary(linearmodel)$r.squared
+```
+Even if the R2 value doesn't show a significant change, we decided to eliminate this point because it is an extreme point that, differently from other observations, doesn't represent the distribution of the data, and so it is considered an outlier.
+
+## Prediction
+
+```{r}
+new_x <- data.frame(Dep_Delay = 10)
+pred_y <- predict(linearmodel, newdata = new_x)
+conf_int <- predict(linearmodel, newdata=new_x, interval ="confidence")
+conf_int
+pred_int <- predict(linearmodel, newdata=new_x, interval ="prediction")
+pred_int
+```
+
+When you set interval = "confidence" it gives you a range that is likely to contain the true mean of the response variable for a given set of predictor values; while when you set interval = "prediction" it gives you a range that is likely to contain an actual single future observation for the response variable given a set of predictor values. So it is understandable why the second range is way wider than the first one.
+
+## Polynomial regression
+
+Considering the previous results we decided to try adding polynomial terms of different powers.
+
+```{r}
+polynomial_model1 = lm(Arr_Delay ~ Dep_Delay + I(Dep_Delay^2), data = data_train)
+summary(polynomial_model1)$r.squared
+
+polynomial_model2 = lm(Arr_Delay ~ poly(Dep_Delay,3, raw=TRUE), data = data_train)
+summary(polynomial_model2)$r.squared
+```
+
+Our analysis includes two polynomial regression models to predict arrival delay based on departure delay. The first model includes linear and quadratic terms, while the second model adds a cubic term. All models fit the data exceptionally well, with R-squared values of 0.9694 and 0.9702, respectively, indicating they explain over 96% of the variance in arrival delay. The last model provides a slightly better fit with a lower residual standard error and marginally higher R-squared value. Observing that, as expected, increasing the polynomial's degrees the model was performing better, we decided to try different degrees. We decided to stop after the third degree to avoid adding exaggerated complexity and reducing the interpretability.
+
+### Plots
+
+```{r, echo=FALSE}
+par(mfrow = c(2, 2))
+plot(polynomial_model1)
+par(mfrow = c(1, 1))
+```
+
+Using the polinomial model of degree 2 we can note that the previous error in overstimeting the biggest delays turned in understimeting it. For the rest of it, we exhibit similar behaviour.
+
+```{r, echo=FALSE}
+par(mfrow = c(2, 2))
+plot(polynomial_model2)
+par(mfrow = c(1, 1))
+```
+
+In the model with polynomial of degree 3 we can note again that the biggest delays are overestimated by the model. It's meaningful to note that some points have an high leverage.
+
+## Non-linear transformation
+
+We did a log transformation of the variable "Arr_Delay"
+
+```{r}
+logmodel <- lm(log(Arr_Delay) ~ Dep_Delay, data = data_train)
+summary(logmodel)$r.squared
+```
+
+Here we explored a different transformation with a log-transformed linear regression model that reveals a significant positive relationship between departure delay and the log-transformed arrival delay, with an R-squared value of 40.32%, indicating a moderate level of explanatory power. We can conclude that this model is less explanatory than the model with the polynomial transformation, meaning that the type of non-linear relationship between the two variables is of the polynomial type.
+
+## Multiple linear regression
+
+```{r}
+multiplemodel = lm(Arr_Delay ~ Dep_Delay + Flight_Duration + Aicraft_age + tavg + tmin + tmax + prcp + snow + wdir + wspd + pres + DepTime_categoric, data = data_train)
+summary(multiplemodel)
+```
+
+Our multiple linear regression model explores the relationship between various factors and arrival delay in flights. As expected, departure delay emerges as highly significant predictor. Flight duration, Aircraft age, Minimum temperature, precipitation and snow are significant influently for the model. While Average temperature, Maximum temperature and Air Pressure, are slightly significant (and will probably be removed from the model), and Wind direction and Wind speed are not significant at all. The model exhibits a high explanatory power with an adjusted R-squared of 0.969, indicating that around 96.90% of the variance in arrival delay is accounted for by the predictors. In addition a residual standard error indicates that, on average, the actual arrival delay differs from the predicted arrival delay by approximately 18.94 minutes.
+
+Moving on to the categorical variable "DepTime_categoric" we interpret the three levels as follow:
+
+-   Flights departing during the afternoon have an average delay in arrival that is approximately 0.887 minutes higher compared to the morning, holding all other variables constant.
+
+-   Flights departing during the evening have an average delay in arrival that is approximately 2.38 minutes lower compared to the morning, holding all other variables constant.
+
+-   Flights departing during the night have an average delay in arrival that is approximately 1.059 minutes higher compared to the reference category, holding all other variables constant.
+
+The observation that we made on it is that, as we expected, the moment in which the flights are more delayed compared to the morning is the night.
+
+## Backward stepwise procedure 1
+
+We now use the backward procedure to eliminate the less significant variables from our model and to try to see what changes at the end.
+
+```{r}
+mod1 <- update(multiplemodel, ~.-tavg)
+mod2 <- update(mod1, ~.-tmax)
+mod3 <- update(mod2, ~.-wdir)
+mod4 <- update(mod3, ~.-wspd)
+summary(mod4)$r.squared
+```
+
+As expected we can see that nothing changed.
+
+## Aic & Bic
+
+Now we use in order R2, AIC and BIC to evaluate the other variables and check if they are useful to the model. First try: delete predictor "pressure"
+
+```{r}
+cat("mod4: R2", summary(mod4)$r.squared, "AIC", AIC(mod4), "BIC", BIC(mod4), "\n")
+mod5 <- update(mod4, ~.-Flight_Duration)
+cat("mod5: R2", summary(mod5)$r.squared, "AIC", AIC(mod5), "BIC", BIC(mod5), "\n")
+```
+
+Since in model4 the R2 is higher and the AIC and BIC are lower we can conclude that this is the best model, so we will keep the regressor pressure in our model.
+
+Second try: delete predictor "Aircraft_age"
+
+```{r}
+mod6 <- update(mod4, ~.-Aicraft_age)
+cat("mod6: R2", summary(mod6)$r.squared, "AIC", AIC(mod6), "BIC", BIC(mod6), "\n")
+```
+
+Since in model4 the R2 is higher and the AIC and BIC are lower we can conclude that this is still the best model, so we will keep the regressor Aircraft age in our model even if the relationship between the two is negative.
+
+## Backward stepwise procedure 2
+
+We then used a different approach that does by itself the backward procedure to check if what we manually did was right.
+
+```{r}
+backward <- regsubsets(Arr_Delay ~ Dep_Delay + Flight_Duration + Aicraft_age + tavg + tmin + tmax + prcp + snow + wdir + wspd + pres + DepTime_categoric, data = data_train, nvmax=10, method="backward")
+
+backward_summary <- summary(backward)
+plot(backward_summary$bic,xlab="Number of Variables",ylab="BIC",type='l')
+i <- which.min(backward_summary$bic)
+points(i,backward_summary$bic[i],col="red",cex=2,pch=20)
+best_model_vars <- backward_summary$which[i, ]
+print(best_model_vars)
+```
+
+Looking at the plot, that set the best number of regressors to 8, and reading the "best_models_vars", can notice how with this method the result and the selected variables, for the final model, are almost the same, except for the variable Air Pressure that has been removed (probably because of its low significance). Regarding the factor variable, even if one of the three levels results to be not significant, it will be all kept in the model since it's not possible to remove just one of them.
+
+## Final multiple model
+
+```{r}
+finalmodel <- update(mod4, ~.-pres)
+summary(finalmodel)
+```
+
+
+### Plots
+```{r, echo=FALSE}
+par(mfrow = c(2, 2))
+plot(finalmodel)
+par(mfrow = c(1, 1))
+```
+In the case of multiple linear regression the Residuals vs Fitted and the Scale-Location plots suggest that the residuals have a non-normal behaviour that is confirmed by the Q-Q plot, as in the linear model, because the distribution of the residuals have a bigger right tail than the normal distribution.
+In conclusion, the graph 'Residuals vs Leverage' shows that all the points are within Cook’s lines that indicate that there are no particularly influential observations that need further analysis.
+
+## Collinearity
+
+```{r}
+vif(finalmodel)
+```
+
+Since the collinearity represents the correlation between predictors, if it is high it avoids them from giving useful information to the model. A collinearity equal to 1 means that there is no collinearity, between 1 and 5 means that there is a moderate collinearity and higher that 5 means that there is high collinearity. In our case we have all values that are pretty close to 1 that means that there is low, almost zero, collinearity and we can keep all the predictors in the model.
+
+# REGRESSION CONCLUSIONS
+
+## Mse
+
+```{r}
+y_pred <- predict(linearmodel, newdata = data_test)
+mse_linear <- mean((y_pred - arr_delay_test)^2)
+print(mse_linear)
+
+y_pred <- predict(polynomial_model1, newdata = data_test)
+mse_poly1 <- mean((y_pred - arr_delay_test)^2)
+print(mse_poly1)
+
+y_pred <- predict(polynomial_model2, newdata = data_test)
+mse_poly2 <- mean((y_pred - arr_delay_test)^2)
+print(mse_poly2)
+
+y_pred <- predict(finalmodel, newdata = data_test)
+mse_multiple <- mean((y_pred - arr_delay_test)^2)
+print(mse_multiple)
+```
+
+To conclude we compared the MSEs of the regression models that we run, to have a final idea on what is the best one. Looking at the results, the considerations that we can make are multiples:
+
+-   the linear model, although its high R2 value, results to be the worst model in terms of MSE (284.2721), for its simplicity
+
+-   the quadratic model and the multiple model have similar MSE value (262.4783 and 262.8619) and, even if the residuals shown a polynomial pattern, suggesting that the quadratic model was going to be the most appropriate, we can notice how, adding more regressors, and so more complexity, we can obtain the same result.
+
+-   the cubic model, show a lower MSE value (respectively 249.0253), demonstrating that, keeping just one regressor, but exponentially increasing the complexity, we could obtain a better model.
+
+In conclusion the decision about the model to use depends on the type of analysis and results that you are looking for: on one hand more complexity ensure better results, on the other hand less complexity ensure more interpretability.
+
+# MODEL DATA: CLASSIFICATION
+## Logistic Regression
+
+In this section we restarted from the beginning, we merged the two datasets, we created the factor variable, we transformed the dependent variable "Ar_Delay" into a binary variable (1 = delayed, 0 = not delayed) and we deleted the variables that were useless for our analysis.
+
+```{r}
+datasetlogistic <- dataset_total
+datasetlogistic$DepTime_categoric <- factor(datasetlogistic$DepTime_label, levels = c("Morning", "Afternoon", "Evening", "Night"),labels = c(1, 2, 3, 4))
+datasetlogistic$Arr_Delay_Binary <- ifelse(datasetlogistic$Arr_Delay > 0, 1, 0)
+datasetlogistic <- na.omit(datasetlogistic)
+useless_variables <- c("Airline", "Dep_CityName", "Arr_Airport", "DepTime_label", "Model", "Dep_Airport")
+datasetlogistic <- datasetlogistic[, -which(names(datasetlogistic) %in% useless_variables)]
+```
+
+```{r}
+cat("Number of delayed flights:", sum(datasetlogistic$Arr_Delay > 0), "Number of not delayed flights:", sum(datasetlogistic$Arr_Delay <= 0))
+```
+
+## Train and test split
+
+For the train and test split phase we used, as before, the date, keeping the flights from January to September as train, and using the flights from October to December as test.
+
+```{r}
+train <- (datasetlogistic$FlightDate < "2023-09-30")
+dl_train <- datasetlogistic[train,]
+dl_test <- datasetlogistic[!train,]
+arr_delay_test <- datasetlogistic$Arr_Delay[!train]
+arr_delay_test <- ifelse(arr_delay_test > 0, "delay", "no_delay")
+cat("Dimension dl_train:", dim(dl_train), "Dimension dl_test:", dim(dl_test))
+```
+
+## Logistic model
+
+We created our logistic model with all the numerical variables and the factor one, using the glm.
+
+```{r}
+model_binary <- glm(Arr_Delay_Binary ~ Dep_Delay + Flight_Duration + Aicraft_age + tavg + tmin + tmax + prcp + snow + wdir + wspd + pres + DepTime_categoric, data = dl_train, family = binomial)
+summary(model_binary)
+```
+
+In the model each coefficient represents the expected change in the log odds, that is the natural logarithm of the ratio of probability of success to probability of failure, for a unit of change in the independent variable, keeping all other independent variables in the model constant. For example, incrementing of one unit the "Dep_Delay" independent variable, contributes positively to the likelihood of the observation being classified into class 1, that means that the more the flight is delayed more probable it is to classify it as delayed, while a one-unit increase in tmin contributes negatively. In addition the null deviance represents the deviation of the null model (i.e., a model without predictive variables) to the data while the residual deviance represents the residual deviation of the model with all the regressors. Since the residual deviation is lower than the null deviation it means that the model has better adaptability than the null model.
+
+## Reduced model
+
+We then removed the not significant variable and created a reduced logistic model.
+
+```{r}
+model_binary_reduced <- glm(Arr_Delay_Binary ~ Dep_Delay + Flight_Duration + Aicraft_age + tmin + prcp + snow + wdir + DepTime_categoric, data = dl_train, family = binomial)
+summary(model_binary_reduced)
+```
+
+Looking at the results we can notice how the residual deviance has increased of 10 units, but the complexity of the model has drastically decreased. While talking about the factor variable "DepTime_Categoric", the coefficients represent the changing in log-odds by moving from the morning to the other three levels, in order: afternoon, evening and nights. So for example the coefficient 4.440e-01 for "DepTime_categoric2" represent that the log-odds of obtaining the flight classified as class 1 increases of 0.444 units when the variable moves from morning to afternoon. For an easier comprehension we can covert this coefficients in odds ratio (OR) using the exponential. For example e\^0.444 ≈ 1.559 that means that with respect to the reference class morning, the probability to obtain the flight classified as class 1 is 1.559 times higher if the variable is afternoon. And the same interpretation holds for the other two levels of the variable.
+
+## Plot ROC
+
+```{r}
+probs <- predict(model_binary_reduced, dl_test, type = "response")
+roc_out <- roc(arr_delay_test, probs, levels = c("no_delay", "delay"))
+plot(roc_out, print.auc = TRUE, legacy.axes = TRUE, xlab = "False positive rate", ylab = "True positive rate")
+```
+
+Given that the diagonal line represents a random classifier that means that any point on this line suggests that the model is guessing randomly and that a ROC curve above the diagonal indicates that the model is performing better than random guessing, the further the curve is from the diagonal and towards the top left corner, the better the model. The AUC quantifies the overall ability of the model to discriminate between positive and negative classes and we get a score of 0.858 that means that our model performs well.
+
+## Linear discriminant analysis
+
+The LDA model calculates the posterior probabilities that a flight belongs to either of the two classes on these predictor variables and then classifies each flight into the class with the highest one. This model is based on the assumption of normal distribution of the predictor variables and common covariance matrix between classes.
+
+```{r}
+lda_model <- lda(Arr_Delay_Binary ~ Dep_Delay + Flight_Duration + Aicraft_age + tmin + prcp + snow + wdir + DepTime_categoric, data = dl_train)
+lda_model
+```
+
+Starting from the beginning we can see that 59.04% of the observations belong to class 1 (delayed), while 40.96% belong to class 0 (not delayed). Then moving to the group means section, and given that it represent the mean values of each predictor variable for each class, it is possible to notice how delayed flights tend to have higher values for Dep_Delay, Flight_Duration, tmin, prcp, snow compared to non-delayed flights. The coefficients, as in the logistic regression model, represent the weights assigned to each predictor variable in the linear combination used to form the discriminant function. That means that a positive coefficient indicates that an increase in the predictor variable value contributes to the likelihood of the observation being classified into class 1, while a negative coefficient suggests the opposite.
+
+## Quadratic Discriminant Analysis (QDA)
+
+The QDA model classifies each class in the same way that QDA does; the difference is in the assumptions. This model is base on the idea that the predictor variables are normally distributed, but it allows each class to have its own covariance matrix.
+
+```{r}
+qda_model <- qda(Arr_Delay_Binary ~ Dep_Delay + Flight_Duration + Aicraft_age + tmin + prcp + snow + wdir + DepTime_categoric, data = dl_train)
+qda_model
+```
+
+Here the proportions of the prior probabilities are the same as LDA. Regarding group means departure Delay, Flight Duration and weather-related variables are higher on average for delayed flights compared to non-delayed flights. For example for non-delayed flights, the average departure delay is -3.16 minutes, suggesting that these flights generally depart earlier than the scheduled time. For delayed flights, the average departure delay is 52.43 minutes, indicating a substantial departure delay.
+
+## Accuracy
+
+```{r}
+y_pred <- predict(model_binary_reduced, newdata = dl_test)
+y_pred_class <- ifelse(y_pred > 0, "delay", "no_delay")
+accuracy_logistic <- mean(y_pred_class == arr_delay_test)
+accuracy_logistic
+
+lda_pred <- predict(lda_model,dl_test)
+lda_class <- ifelse(lda_pred$class == 1, "delay", "no_delay")
+conf_matrix <- table(lda_class, arr_delay_test)
+accuracy_lda <- sum(diag(conf_matrix)) / sum(conf_matrix)
+accuracy_lda
+
+
+qda_pred <- predict(qda_model,dl_test)
+qda_class <- ifelse(qda_pred$class == 1, "delay", "no_delay")
+conf_matrix <- table(qda_class, arr_delay_test)
+accuracy_qda <- sum(diag(conf_matrix)) / sum(conf_matrix)
+accuracy_qda
+```
+
+To conclude we compared the accuracies of the classification models that we run, to have a final idea on what is the best one. Looking at the results, the considerations that we can make are multiples:
+
+-   Logistic Regression performs the best overall, suggesting that the data is well-suited to a model with linear decision boundaries without assuming normality.
+
+-   QDA's performance is also strong, indicating that the flexibility of quadratic boundaries is beneficial.
+
+-   LDA, while still effective, has the lowest accuracy, potentially due to its more restrictive assumptions about the data distribution.
+
+In conclusion, Logistic Regression seems to be the most accurate model for this dataset, even if QDA is also good and allows for a more flexible decision boundary by considering quadratic terms, which can capture complex relationships between predictor variables and the response variable.

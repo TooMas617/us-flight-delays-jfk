@@ -1,0 +1,11 @@
+# Dati di Kaggle (1,16 GB): si scaricano a parte, vedi data/README.md
+data/*.csv
+
+# Output generati dal Knit (il report finale e' in report/)
+flight_delays_jfk.html
+flight_delays_jfk_files/
+
+# File di sessione di R e RStudio
+.Rhistory
+.RData
+.Rproj.user/
